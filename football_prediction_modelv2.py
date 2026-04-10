@@ -901,6 +901,8 @@ class DixonColesModel:
                        options={"maxiter": 500, "ftol": 1e-9, "gtol": 1e-6})
         self.params_ = res.x
         self.params_[:n] -= self.params_[:n].mean()
+        # [FIX C4] Centrar betas (defesa) — identificabilidade completa
+        self.params_[n:2*n] -= self.params_[n:2*n].mean()
         print(f"✅ Dixon-Coles ajustado | LL={-res.fun:.2f} | Convergiu:{res.success}")
 
     def predict_lambda(self, home, away):
@@ -930,10 +932,17 @@ class DixonColesModel:
         return np.maximum(m, 0) / np.maximum(m, 0).sum()
 
 
-# Treino
+# Treino — DC completo (para previsão final)
 dc_model = DixonColesModel(xi=0.005)   # [FIX #7]
 dc_model.fit(df.dropna(subset=["hg", "ag"]).reset_index(drop=True))
-# [FIX #3] calibrate_rho_res removido — não é mais necessário
+
+# [FIX C1] DC separado para features ML — treinado apenas nos primeiros 60%
+# Elimina data leakage: XGBoost nunca vê features DC calculadas com dados futuros
+_df_dc_all = df.dropna(subset=["hg", "ag"]).sort_values("date").reset_index(drop=True)
+_n_dc_train = int(len(_df_dc_all) * 0.60)
+dc_train = DixonColesModel(xi=0.005)
+dc_train.fit(_df_dc_all.iloc[:_n_dc_train].reset_index(drop=True))
+print(f"   [FIX C1] DC treino: {_n_dc_train} jogos | DC completo: {len(_df_dc_all)} jogos")
 
 
 # ╔══════════════════════════════════════════════════════════╗
@@ -958,8 +967,9 @@ def add_poisson_features(df_feat: pd.DataFrame,
     ai = df_feat["away"].map(dc._idx).values.astype(float)
 
     valid = ~(np.isnan(hi) | np.isnan(ai))
-    lh_arr = np.full(len(df_feat), np.nan)
-    la_arr = np.full(len(df_feat), np.nan)
+    # [FIX C1] Default para times desconhecidos: força média (alpha=0, beta=0)
+    lh_arr = np.full(len(df_feat), np.exp(gamma))   # lambda home "neutro"
+    la_arr = np.full(len(df_feat), np.exp(0.0))      # lambda away "neutro" = 1.0
 
     hi_v = hi[valid].astype(int)
     ai_v = ai[valid].astype(int)
@@ -1127,13 +1137,13 @@ def train_models_walkforward(X: pd.DataFrame, ys_cls: dict,
     feature_medians = X_tr.median()
 
     # ── Classificadores ──
-    # SEM CalibratedClassifierCV — XGBoost com softmax/logistic já produz
-    # probabilidades razoáveis. A calibração externa com poucos dados
-    # CAUSA o problema de 99.9%/0.1% por extrapolação sigmoid.
+    # [FIX G1] Early stopping com holdout 60-80% para evitar overfitting
+    X_val_es = X.iloc[n_train:n_alpha_end]  # eval set para early stopping
     for target, y in ys_cls.items():
         print(f"\n🔧 Treinando classificador: {target}")
         multi = (target == "y_1x2")
         y_tr = y.iloc[:n_train]
+        y_val_es = y.iloc[n_train:n_alpha_end]
 
         # [FIX #19] Optuna tuning
         if tune and OPTUNA_AVAILABLE:
@@ -1150,7 +1160,17 @@ def train_models_walkforward(X: pd.DataFrame, ys_cls: dict,
             eval_metric="mlogloss" if multi else "logloss",
             random_state=42, n_jobs=-1
         )
-        clf.fit(X_tr, y_tr, verbose=False)
+        # [FIX G1] Early stopping: para de treinar quando validação piora
+        if len(y_val_es) > 0:
+            clf.fit(X_tr, y_tr,
+                    eval_set=[(X_val_es, y_val_es)],
+                    early_stopping_rounds=30, verbose=False)
+            n_trees = getattr(clf, 'best_iteration', best_params.get('n_estimators', 300))
+            if n_trees is not None:
+                print(f"   Early stopping: {n_trees + 1} árvores "
+                      f"(max {best_params.get('n_estimators', 300)})")
+        else:
+            clf.fit(X_tr, y_tr, verbose=False)
         models_cls[target] = clf
 
         # Avaliação no holdout de alpha (60-80%) — dados não vistos
@@ -1166,6 +1186,7 @@ def train_models_walkforward(X: pd.DataFrame, ys_cls: dict,
     for target, y in ys_reg.items():
         print(f"\n🔧 Treinando regressor: {target}")
         y_tr = y.iloc[:n_train]
+        y_val_reg = y.iloc[n_train:n_alpha_end]
 
         reg = xgb.XGBRegressor(
             n_estimators=200,
@@ -1177,7 +1198,13 @@ def train_models_walkforward(X: pd.DataFrame, ys_cls: dict,
             random_state=42,
             n_jobs=-1
         )
-        reg.fit(X_tr, y_tr, verbose=False)
+        # [FIX G1] Early stopping para regressores também
+        if len(y_val_reg) > 0:
+            reg.fit(X_tr, y_tr,
+                    eval_set=[(X_val_es, y_val_reg)],
+                    early_stopping_rounds=30, verbose=False)
+        else:
+            reg.fit(X_tr, y_tr, verbose=False)
         models_reg[target] = reg
 
         X_val = X.iloc[n_train:n_alpha_end]
@@ -1196,7 +1223,8 @@ def train_models_walkforward(X: pd.DataFrame, ys_cls: dict,
 
 
 print("⚙️  Preparando dataset ML...")
-X_all, y_all_cls, y_all_reg, feat_names = prepare_ml_dataset(df_feat, dc_model)
+# [FIX C1] Usa dc_train (60%) para features — sem leakage
+X_all, y_all_cls, y_all_reg, feat_names = prepare_ml_dataset(df_feat, dc_train)
 
 print(f"   Dataset: {X_all.shape[0]} amostras × {X_all.shape[1]} features")
 print("⚙️  Treinando modelos (walk-forward, Optuna, sigmoid)...")
@@ -1304,28 +1332,43 @@ def ensemble_predict(home: str, away: str,
     if alpha is None:
         alpha = ALPHA
 
-    # ── Poisson analítico ──
+    # ── [FIX C2] Probabilidades derivadas da score_matrix DC (consistente) ──
+    # Todos os mercados derivados da MESMA matriz, incluindo correlação rho
     lh_an, la_an = dc.predict_lambda(home, away)
     _mat   = dc.score_matrix(home, away, max_goals=10)
-    _goals = np.arange(11)
     _pH_an = float(np.tril(_mat, -1).sum())
     _pA_an = float(np.triu(_mat,  1).sum())
     _pD_an = float(np.diag(_mat).sum())
     _s     = _pH_an + _pD_an + _pA_an
     _pH_an, _pD_an, _pA_an = _pH_an/_s, _pD_an/_s, _pA_an/_s
 
-    _ph = poisson.pmf(_goals, lh_an)
-    _pa = poisson.pmf(_goals, la_an)
-    _max_total = 20
-    _total_pmf = np.convolve(_ph, _pa)[:_max_total+1]
+    # [FIX C2] Over/Under total derivado da score_matrix (NÃO de Poisson independente)
+    _max_g = _mat.shape[0]
+    _total_pmf = np.zeros(2 * _max_g - 1)
+    for _i in range(_max_g):
+        for _j in range(_max_g):
+            _total_pmf[_i + _j] += _mat[_i, _j]
     _total_pmf /= _total_pmf.sum()
-    _total_cdf  = np.cumsum(_total_pmf)
+    _total_cdf = np.cumsum(_total_pmf)
 
     def _ov_total(k):
         return float(1 - _total_cdf[k]) if k < len(_total_cdf) else 0.0
 
-    def _ov_team(lam, k):
-        return float(1 - poisson.cdf(k-1, lam))
+    # [FIX C2] Marginais por time da score_matrix (inclui correlação DC)
+    _home_marginal = _mat.sum(axis=1)  # P(home=i) — soma sobre colunas
+    _away_marginal = _mat.sum(axis=0)  # P(away=j) — soma sobre linhas
+    _home_cdf = np.cumsum(_home_marginal)
+    _away_cdf = np.cumsum(_away_marginal)
+
+    def _ov_home(k):
+        """P(home goals >= k) derivado da matrix DC"""
+        if k <= 0: return 1.0
+        return float(1.0 - _home_cdf[k - 1]) if k - 1 < len(_home_cdf) else 0.0
+
+    def _ov_away(k):
+        """P(away goals >= k) derivado da matrix DC"""
+        if k <= 0: return 1.0
+        return float(1.0 - _away_cdf[k - 1]) if k - 1 < len(_away_cdf) else 0.0
 
     _btts_yes = float(_mat[1:, 1:].sum())
 
@@ -1337,35 +1380,51 @@ def ensemble_predict(home: str, away: str,
         "DC_12": _pH_an+_pA_an,
         "ov15": _ov_total(1), "ov25": _ov_total(2), "ov35": _ov_total(3),
         "un15": 1-_ov_total(1), "un25": 1-_ov_total(2), "un35": 1-_ov_total(3),
-        "h_ov05": _ov_team(lh_an,1), "h_ov15": _ov_team(lh_an,2),
-        "h_ov25": _ov_team(lh_an,3), "h_ov35": _ov_team(lh_an,4),
-        "a_ov05": _ov_team(la_an,1), "a_ov15": _ov_team(la_an,2),
-        "a_ov25": _ov_team(la_an,3), "a_ov35": _ov_team(la_an,4),
+        "h_ov05": _ov_home(1), "h_ov15": _ov_home(2),
+        "h_ov25": _ov_home(3), "h_ov35": _ov_home(4),
+        "a_ov05": _ov_away(1), "a_ov15": _ov_away(2),
+        "a_ov25": _ov_away(3), "a_ov35": _ov_away(4),
         "btts_yes": _btts_yes, "btts_no": 1-_btts_yes,
         "lambda_home": lh_an, "lambda_away": la_an,
     }
 
-    # [FIX #5] Busca features na timeline UNIFICADA
-    # Em vez de buscar separadamente por venue, busca o ÚLTIMO jogo de cada time
-    # e mapeia as colunas corretamente
+    # ── [FIX C3] Feature lookup corrigido — timeline unificada com remapeamento ──
+    # O código original lia h_ features apenas do último jogo como MANDANTE,
+    # ignorando jogos recentes como visitante. Se o time jogou 3x fora seguidas,
+    # as features ficavam desatualizadas por semanas.
+    # Agora: busca o jogo MAIS RECENTE (qualquer venue) e remapeia os prefixos.
     if cutoff_date is not None:
         df_ref = df_feat[df_feat["date"] < cutoff_date]
     else:
         df_ref = df_feat
 
-    # Último jogo como MANDANTE para pegar h_ features
-    h_home_rows = df_ref[df_ref["home"] == home].sort_values("date")
-    # Último jogo como VISITANTE para pegar a_ features
-    a_away_rows = df_ref[df_ref["away"] == away].sort_values("date")
+    def _find_latest(team, df_r):
+        """Encontra jogo mais recente do time (qualquer venue)."""
+        mask = (df_r["home"] == team) | (df_r["away"] == team)
+        sub = df_r[mask]
+        if sub.empty:
+            return None, None
+        row = sub.sort_values("date").iloc[-1]
+        return row, (row["home"] == team)
 
-    # [FIX #5] Fallback: último jogo em QUALQUER venue, com remapeamento
-    # Se o time não jogou como mandante recentemente, usa último jogo fora
-    # e mapeia a_roll_* → h_roll_* (invertendo perspectiva)
-    h_any_rows = df_ref[(df_ref["home"]==home)|(df_ref["away"]==home)].sort_values("date")
-    a_any_rows = df_ref[(df_ref["home"]==away)|(df_ref["away"]==away)].sort_values("date")
+    def _find_latest_venue(team, as_home, df_r):
+        """Encontra jogo mais recente do time em venue específico."""
+        col = "home" if as_home else "away"
+        sub = df_r[df_r[col] == team]
+        if sub.empty:
+            return None
+        return sub.sort_values("date").iloc[-1]
 
-    h_row = h_home_rows.tail(1) if not h_home_rows.empty else h_any_rows.tail(1)
-    a_row = a_away_rows.tail(1) if not a_away_rows.empty else a_any_rows.tail(1)
+    h_latest, h_was_home = _find_latest(home, df_ref)
+    a_latest, a_was_home = _find_latest(away, df_ref)
+    h_at_home_row = _find_latest_venue(home, True, df_ref)   # último como mandante
+    a_at_away_row = _find_latest_venue(away, False, df_ref)  # último como visitante
+
+    # Último confronto direto (para H2H features — par-específico)
+    _h2h_mask = ((df_ref["home"] == home) & (df_ref["away"] == away)) | \
+                ((df_ref["home"] == away) & (df_ref["away"] == home))
+    _h2h_sub = df_ref[_h2h_mask]
+    h2h_row = _h2h_sub.sort_values("date").iloc[-1] if not _h2h_sub.empty else None
 
     extra = {
         "dc_lh":    p_mc["lambda_home"],
@@ -1374,21 +1433,88 @@ def ensemble_predict(home: str, away: str,
         "dc_ratio": p_mc["lambda_home"] / max(p_mc["lambda_away"], 0.01),
     }
 
+    def _read(row, col):
+        """Lê uma feature de uma Series pandas, retorna float ou NaN."""
+        if row is None:
+            return np.nan
+        val = row.get(col)
+        if val is None:
+            return np.nan
+        try:
+            v = float(val)
+            return v if not np.isnan(v) else np.nan
+        except (ValueError, TypeError):
+            return np.nan
+
     feat_vec = {}
     for c in feat_names:
         val = np.nan
-        if c.startswith("h_") and c in h_row.columns:
-            v = h_row[c].values
-            val = v[0] if len(v) > 0 and not pd.isna(v[0]) else np.nan
-        elif c.startswith("a_") and c in a_row.columns:
-            v = a_row[c].values
-            val = v[0] if len(v) > 0 and not pd.isna(v[0]) else np.nan
-        elif c in extra:
+
+        if c in extra:
             val = extra[c]
-        elif c in h_row.columns:
-            v = h_row[c].values
-            val = v[0] if len(v) > 0 and not pd.isna(v[0]) else np.nan
+
+        elif c.startswith("h_"):
+            suffix = c[2:]  # remove "h_"
+            if "venue_h" in suffix:
+                # Feature venue-casa: só do último jogo como mandante
+                val = _read(h_at_home_row, c)
+            elif h_latest is not None:
+                # Feature global: do jogo mais recente, com remapeamento
+                if h_was_home:
+                    val = _read(h_latest, c)              # h_ direto
+                else:
+                    val = _read(h_latest, f"a_{suffix}")  # remap a_ → h_
+
+        elif c.startswith("a_"):
+            suffix = c[2:]  # remove "a_"
+            if "venue_a" in suffix:
+                # Feature venue-fora: só do último jogo como visitante
+                val = _read(a_at_away_row, c)
+            elif a_latest is not None:
+                # Feature global: do jogo mais recente, com remapeamento
+                if not a_was_home:
+                    val = _read(a_latest, c)              # a_ direto
+                else:
+                    val = _read(a_latest, f"h_{suffix}")  # remap h_ → a_
+
+        elif c.startswith("diff_"):
+            pass  # recomputados após o loop a partir dos h_ e a_ já buscados
+
+        elif c.startswith("h2h_"):
+            # H2H features: do último confronto direto entre ESTE PAR
+            val = _read(h2h_row, c)
+
+        elif "home" in c:
+            # elo_home, rest_days_home, table_pts_home, etc.
+            if h_latest is not None:
+                val = _read(h_latest, c if h_was_home else c.replace("home", "away"))
+
+        elif "away" in c:
+            # elo_away, rest_days_away, table_pts_away, etc.
+            if a_latest is not None:
+                val = _read(a_latest, c if not a_was_home else c.replace("away", "home"))
+
+        else:
+            val = _read(h_latest, c)
+
         feat_vec[c] = val
+
+    # [FIX C3] Recomputa diferenciais a partir dos h_ e a_ já buscados
+    # (não herda diff_ de uma partida anterior com outro adversário)
+    for n in ROLLING_WINDOWS:
+        for h_key, a_key, d_key in [
+            (f"h_roll_xgf_{n}", f"a_roll_xgf_{n}", f"diff_xgf_{n}"),
+            (f"h_roll_xga_{n}", f"a_roll_xga_{n}", f"diff_xga_{n}"),
+            (f"h_roll_pts_{n}", f"a_roll_pts_{n}", f"diff_pts_{n}"),
+            (f"h_roll_win_{n}", f"a_roll_win_{n}", f"diff_win_{n}"),
+        ]:
+            hv = feat_vec.get(h_key, np.nan)
+            av = feat_vec.get(a_key, np.nan)
+            if isinstance(hv, float) and isinstance(av, float) \
+               and not np.isnan(hv) and not np.isnan(av):
+                feat_vec[d_key] = hv - av
+            else:
+                feat_vec[d_key] = np.nan
 
     X_pred = pd.DataFrame([feat_vec])[feat_names].astype(float)
 
@@ -1525,7 +1651,8 @@ _n_alpha_end = split_info["n_alpha_end"]
 _df_feat_val = df_feat.iloc[_n_train:_n_alpha_end].copy()
 print(f"   Holdout alpha: partidas {_n_train}–{_n_alpha_end} "
       f"({len(_df_feat_val)} jogos, SEPARADO do treino ML)")
-ALPHA = optimize_alpha(dc_model, ml_models, _df_feat_val,
+# [FIX C1] Usa dc_train para alpha — consistente com features ML
+ALPHA = optimize_alpha(dc_train, ml_models, _df_feat_val,
                         feat_names, FEATURE_MEDIANS)
 print(f"   ALPHA final: {ALPHA}")
 
