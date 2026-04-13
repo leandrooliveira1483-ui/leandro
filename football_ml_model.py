@@ -75,7 +75,7 @@ print("✅ Imports OK")
 
 # Liga e temporadas
 LEAGUE = "ENG-Premier League"
-SEASONS = [2020, 2021, 2022, 2023, 2024]
+SEASONS = [2020, 2021, 2022, 2023, 2024, 2025, 2026]
 
 # Janelas de forma
 WINDOWS = [3, 5, 10, 20]
