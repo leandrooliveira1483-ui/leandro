@@ -651,8 +651,14 @@ class DixonColesModel:
     def predict_lambda(self, home, away):
         n = len(self.teams_)
         a, b, g = self.params_[:n], self.params_[n:2 * n], self.params_[2 * n]
-        hi, ai = self._idx[home], self._idx[away]
-        return np.exp(a[hi] - b[ai] + g), np.exp(a[ai] - b[hi])
+        # Fallback para times desconhecidos: ataque=0, defesa=0 (média)
+        hi = self._idx.get(home)
+        ai = self._idx.get(away)
+        att_h = a[hi] if hi is not None else 0.0
+        def_a = b[ai] if ai is not None else 0.0
+        att_a = a[ai] if ai is not None else 0.0
+        def_h = b[hi] if hi is not None else 0.0
+        return np.exp(att_h - def_a + g), np.exp(att_a - def_h)
 
     def score_matrix(self, home, away, max_g=10):
         lh, la = self.predict_lambda(home, away)
@@ -1494,21 +1500,30 @@ def predict_batch(jogos, dc=None, ml=None, df_ref=None):
     if df_ref is None: df_ref = df_feat
 
     rows = []
+    n_err = 0
     for j in tqdm(jogos, desc="Prevendo"):
         try:
             _, r = predict_match(j["home"], j["away"], dc, ml, df_ref, show_plots=False)
-            r["rodada"] = j.get("rodada", "?")
-            r["date"] = j.get("date", "?")
-            r["home"] = j["home"]
-            r["away"] = j["away"]
-            rows.append(r)
+            row = {
+                "rodada": j.get("rodada", "?"),
+                "date": j.get("date", "?"),
+                "home": j["home"],
+                "away": j["away"],
+            }
+            row.update(r)
+            rows.append(row)
         except Exception as e:
+            n_err += 1
             logger.warning(f"Erro: {j.get('home')} × {j.get('away')}: {e}")
 
-    df_b = pd.DataFrame(rows)
-    id_cols = ["rodada", "date", "home", "away"]
-    outros = [c for c in df_b.columns if c not in id_cols]
-    return df_b[id_cols + outros]
+    if n_err > 0:
+        print(f"⚠️  {n_err} de {len(jogos)} jogos falharam")
+
+    if not rows:
+        print("❌ Nenhum jogo previsto com sucesso.")
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
 
 
 def load_predict_excel(path, export_csv=True):
